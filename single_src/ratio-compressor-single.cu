@@ -36,7 +36,9 @@ URL: The latest version of this code is available at https://github.com/burtsche
 Sponsor: This code is based upon work supported by the U.S. Department of Energy, Office of Science, Office of Advanced Scientific Research (ASCR), under contract DE-SC0022223.
 */
 
+#ifndef NDEBUG
 #define NDEBUG
+#endif
 
 using byte = unsigned char;
 static const int CS = 1024 * 16;  // chunk size (in bytes) [must be multiple of 8]
@@ -102,10 +104,12 @@ static inline __device__ void s2g(void* const __restrict__ destination, const vo
 static __device__ int g_chunk_counter;
 
 
+#ifndef FPCOMPRESS_LIBRARY
 static __global__ void d_reset()
 {
   g_chunk_counter = 0;
 }
+#endif
 
 
 static inline __device__ void propagate_carry(const int value, const int chunkID, volatile int* const __restrict__ fullcarry, int* const __restrict__ s_fullc)
@@ -151,7 +155,7 @@ static inline __device__ void propagate_carry(const int value, const int chunkID
 
 
 static __global__ __launch_bounds__(TPB, 4)
-void d_encode(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry)
+void d_encode(const byte* const __restrict__ input, const int insize, byte* const __restrict__ output, int* const __restrict__ outsize, int* const __restrict__ fullcarry, int* call_counter = nullptr)
 {
   // allocate shared memory buffer
   __shared__ long long chunk [2 * (CS / sizeof(long long)) + ((WS + 1) * 4 + 2048 + 256 + 32 + 4 + 7) / 8];
@@ -174,7 +178,7 @@ void d_encode(const byte* const __restrict__ input, const int insize, byte* cons
   const int tid = threadIdx.x;
   do {
     // assign work dynamically
-    if (tid == WS) chunk[last] = atomicAdd(&g_chunk_counter, 1);
+    if (tid == WS) chunk[last] = atomicAdd(call_counter ? call_counter : &g_chunk_counter, 1);
     __syncthreads();  // chunk[last] produced, chunk consumed
 
     // terminate if done
@@ -233,6 +237,38 @@ void d_encode(const byte* const __restrict__ input, const int insize, byte* cons
 }
 
 
+#ifdef FPCOMPRESS_LIBRARY
+#include "../src/fpcompress_internal.cuh"
+
+namespace fpcompress_detail {
+cudaError_t sp_ratio_encode(const unsigned char* input, size_t bytes,
+    unsigned char* output, size_t* output_bytes, void* workspace,
+    cudaStream_t stream) {
+  cudaError_t error;
+  auto* scratch = static_cast<unsigned char*>(workspace);
+  auto* encoded_size = reinterpret_cast<int*>(scratch + 8);
+  auto* carry = reinterpret_cast<int*>(scratch + 256);
+  auto* counter = reinterpret_cast<int*>(scratch);
+  const size_t working = bytes;
+  const size_t carry_bytes = ((working + CS - 1) / CS) * sizeof(int);
+  int blocks;
+  error = launch_blocks(&blocks);
+  if (error != cudaSuccess) return error;
+  error = cudaMemsetAsync(counter, 0, sizeof(*counter), stream);
+  if (error != cudaSuccess) return error;
+  error = cudaMemsetAsync(carry, 0, carry_bytes, stream);
+  if (error != cudaSuccess) return error;
+  d_encode<<<blocks, TPB, 0, stream>>>(input,
+      static_cast<int>(working), output, encoded_size, carry, counter);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  publish_size<<<1, 1, 0, stream>>>(encoded_size, output_bytes);
+  return cudaGetLastError();
+}
+} // namespace fpcompress_detail
+#endif
+
+#ifndef FPCOMPRESS_LIBRARY
 struct GPUTimer
 {
   cudaEvent_t beg, end;
@@ -363,3 +399,5 @@ int main(int argc, char* argv [])
   cudaFreeHost(dencoded);
   return 0;
 }
+
+#endif // FPCOMPRESS_LIBRARY

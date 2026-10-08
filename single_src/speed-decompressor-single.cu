@@ -37,7 +37,9 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 */
 
 
+#ifndef NDEBUG
 #define NDEBUG
+#endif
 
 using byte = unsigned char;
 static const int CS = 1024 * 16;  // chunk size (in bytes) [must be multiple of 8]
@@ -112,14 +114,16 @@ static inline __device__ void g2s(void* const __restrict__ destination, const vo
 static __device__ int g_chunk_counter;
 
 
+#ifndef FPCOMPRESS_LIBRARY
 static __global__ void d_reset()
 {
   g_chunk_counter = 0;
 }
+#endif
 
 
 static __global__ __launch_bounds__(TPB, 4)
-void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, int* const __restrict__ g_outsize)
+void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, int* const __restrict__ g_outsize, int* call_counter = nullptr)
 {
   // allocate shared memory buffer
   __shared__ long long chunk [2 * (CS / sizeof(long long)) + 4 + 16];
@@ -146,7 +150,7 @@ void d_decode(const byte* const __restrict__ input, byte* const __restrict__ out
   int prevOffset = 0;
   do {
     // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1);
+    if (tid == 0) chunk[last] = atomicAdd(call_counter ? call_counter : &g_chunk_counter, 1);
     __syncthreads();  // chunk[last] produced, chunk consumed
 
     // terminate if done
@@ -192,6 +196,31 @@ void d_decode(const byte* const __restrict__ input, byte* const __restrict__ out
 }
 
 
+#ifdef FPCOMPRESS_LIBRARY
+#include "../src/fpcompress_internal.cuh"
+
+namespace fpcompress_detail {
+cudaError_t sp_speed_decode(const unsigned char* input, size_t,
+    unsigned char* output, void* workspace, cudaStream_t stream) {
+  cudaError_t error;
+  auto* scratch = static_cast<unsigned char*>(workspace);
+  auto* decoded_size = reinterpret_cast<int*>(scratch + 8);
+  auto* counter = reinterpret_cast<int*>(scratch);
+  auto* transformed = output;
+  int blocks;
+  error = launch_blocks(&blocks);
+  if (error != cudaSuccess) return error;
+  error = cudaMemsetAsync(counter, 0, sizeof(*counter), stream);
+  if (error != cudaSuccess) return error;
+  d_decode<<<blocks, TPB, 0, stream>>>(input, transformed, decoded_size, counter);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  return cudaSuccess;
+}
+} // namespace fpcompress_detail
+#endif
+
+#ifndef FPCOMPRESS_LIBRARY
 struct GPUTimer
 {
   cudaEvent_t beg, end;
@@ -318,3 +347,5 @@ int main(int argc, char* argv [])
   cudaFreeHost(ddecoded);
   return 0;
 }
+
+#endif // FPCOMPRESS_LIBRARY

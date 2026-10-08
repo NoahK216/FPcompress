@@ -37,7 +37,9 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 */
 
 
+#ifndef NDEBUG
 #define NDEBUG
+#endif
 
 using byte = unsigned char;
 static const int CS = 1024 * 16;  // chunk size (in bytes) [must be multiple of 8]
@@ -119,10 +121,12 @@ static inline __device__ void g2s(void* const __restrict__ destination, const vo
 static __device__ unsigned long long g_chunk_counter;
 
 
+#ifndef FPCOMPRESS_LIBRARY
 static __global__ void d_reset()
 {
   g_chunk_counter = 0LL;
 }
+#endif
 
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800)
@@ -130,7 +134,7 @@ static __global__ __launch_bounds__(TPB, 3)
 #else
 static __global__ __launch_bounds__(TPB, 2)
 #endif
-void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, long long* const __restrict__ g_outsize)
+void d_decode(const byte* const __restrict__ input, byte* const __restrict__ output, long long* const __restrict__ g_outsize, unsigned long long* call_counter = nullptr)
 {
   // allocate shared memory buffer
   __shared__ long long chunk [3 * (CS / sizeof(long long))];
@@ -151,7 +155,7 @@ void d_decode(const byte* const __restrict__ input, byte* const __restrict__ out
   long long prevOffset = 0;
   do {
     // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1LL);
+    if (tid == 0) chunk[last] = atomicAdd(call_counter ? call_counter : &g_chunk_counter, 1LL);
     __syncthreads();  // chunk[last] produced, chunk consumed
 
     // terminate if done
@@ -210,6 +214,39 @@ void d_decode(const byte* const __restrict__ input, byte* const __restrict__ out
 }
 
 
+#ifdef FPCOMPRESS_LIBRARY
+#include "../src/fpcompress_internal.cuh"
+
+namespace fpcompress_detail {
+cudaError_t dp_ratio_decode(const unsigned char* input, size_t bytes,
+    unsigned char* output, void* workspace, cudaStream_t stream) {
+  cudaError_t error;
+  auto* scratch = static_cast<unsigned char*>(workspace);
+  auto* decoded_size = reinterpret_cast<long long*>(scratch + 8);
+  auto* counter = reinterpret_cast<unsigned long long*>(scratch);
+  auto* transformed = scratch + 256;
+  int blocks;
+  error = launch_blocks(&blocks);
+  if (error != cudaSuccess) return error;
+  error = cudaMemsetAsync(counter, 0, sizeof(*counter), stream);
+  if (error != cudaSuccess) return error;
+  d_decode<<<blocks, TPB, 0, stream>>>(input, transformed, decoded_size, counter);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  const int count = static_cast<int>(bytes / 8);
+  parallel_union_find<<<(count + TPB - 1) / TPB, TPB, 0, stream>>>(
+      reinterpret_cast<unsigned long long*>(transformed), count);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  error = cudaMemcpyAsync(output, transformed, bytes,
+      cudaMemcpyDeviceToDevice, stream);
+  if (error != cudaSuccess) return error;
+  return cudaSuccess;
+}
+} // namespace fpcompress_detail
+#endif
+
+#ifndef FPCOMPRESS_LIBRARY
 struct GPUTimer
 {
   cudaEvent_t beg, end;
@@ -337,3 +374,5 @@ int main(int argc, char* argv [])
   cudaFreeHost(ddecoded);
   return 0;
 }
+
+#endif // FPCOMPRESS_LIBRARY

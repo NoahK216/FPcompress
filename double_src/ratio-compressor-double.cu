@@ -37,7 +37,9 @@ Sponsor: This code is based upon work supported by the U.S. Department of Energy
 */
 
 
+#ifndef NDEBUG
 #define NDEBUG
+#endif
 
 using byte = unsigned char;
 static const int CS = 1024 * 16;  // chunk size (in bytes) [must be multiple of 8]
@@ -109,10 +111,12 @@ static inline __device__ void s2g(void* const __restrict__ destination, const vo
 static __device__ unsigned long long g_chunk_counter;
 
 
+#ifndef FPCOMPRESS_LIBRARY
 static __global__ void d_reset()
 {
   g_chunk_counter = 0LL;
 }
+#endif
 
 
 static inline __device__ void propagate_carry(const int value, const long long chunkID, volatile long long* const __restrict__ fullcarry, long long* const __restrict__ s_fullc)
@@ -163,7 +167,7 @@ static __global__ __launch_bounds__(TPB, 3)
 #else
 static __global__ __launch_bounds__(TPB, 2)
 #endif
-void d_encode(const byte* const __restrict__ input, const long long insize, byte* const __restrict__ output, long long* const __restrict__ outsize, long long* const __restrict__ fullcarry)
+void d_encode(const byte* const __restrict__ input, const long long insize, byte* const __restrict__ output, long long* const __restrict__ outsize, long long* const __restrict__ fullcarry, unsigned long long* call_counter = nullptr)
 {
   // allocate shared memory buffer
   __shared__ long long chunk [3 * (CS / sizeof(long long))];
@@ -184,7 +188,7 @@ void d_encode(const byte* const __restrict__ input, const long long insize, byte
   // loop over chunks
   do {
     // assign work dynamically
-    if (tid == 0) chunk[last] = atomicAdd(&g_chunk_counter, 1LL);
+    if (tid == 0) chunk[last] = atomicAdd(call_counter ? call_counter : &g_chunk_counter, 1LL);
     __syncthreads();  // chunk[last] produced, chunk consumed
 
     // terminate if done
@@ -254,6 +258,76 @@ void d_encode(const byte* const __restrict__ input, const long long insize, byte
 }
 
 
+#ifdef FPCOMPRESS_LIBRARY
+#include "../src/fpcompress_internal.cuh"
+
+namespace fpcompress_detail {
+cudaError_t dp_ratio_compress_workspace_size(size_t bytes, size_t* size) {
+  cudaError_t error;
+  size_t sort_bytes = 0;
+  if (bytes) {
+    error = cub::DeviceRadixSort::SortKeys(nullptr, sort_bytes,
+        static_cast<unsigned long long*>(nullptr),
+        static_cast<unsigned long long*>(nullptr), static_cast<int>(bytes / 8));
+    if (error != cudaSuccess) return error;
+  }
+  *size = 256 + pad(((2 * bytes + CS - 1) / CS) * sizeof(long long))
+      + pad(2 * bytes) + 2 * pad(bytes) + pad(sort_bytes);
+  return cudaSuccess;
+}
+
+cudaError_t dp_ratio_encode(const unsigned char* input, size_t bytes,
+    unsigned char* output, size_t* output_bytes, void* workspace,
+    cudaStream_t stream) {
+  cudaError_t error;
+  auto* scratch = static_cast<unsigned char*>(workspace);
+  auto* encoded_size = reinterpret_cast<long long*>(scratch + 8);
+  auto* carry = reinterpret_cast<long long*>(scratch + 256);
+  auto* counter = reinterpret_cast<unsigned long long*>(scratch);
+  const size_t working = 2 * bytes;
+  const size_t carry_bytes = ((working + CS - 1) / CS) * sizeof(long long);
+  int blocks;
+  error = launch_blocks(&blocks);
+  if (error != cudaSuccess) return error;
+  error = cudaMemsetAsync(counter, 0, sizeof(*counter), stream);
+  if (error != cudaSuccess) return error;
+  error = cudaMemsetAsync(carry, 0, carry_bytes, stream);
+  if (error != cudaSuccess) return error;
+  auto* transformed = scratch + 256 + pad(carry_bytes);
+  auto* hashes = reinterpret_cast<unsigned long long*>(transformed + pad(working));
+  auto* sorted = reinterpret_cast<unsigned long long*>(
+      reinterpret_cast<unsigned char*>(hashes) + pad(bytes));
+  void* sort_storage = reinterpret_cast<unsigned char*>(sorted) + pad(bytes);
+  size_t sort_bytes = 0;
+  const int count = static_cast<int>(bytes / 8);
+  const int preprocessing_blocks = (count + TPB - 1) / TPB;
+  FCMp_8_kernel1<<<preprocessing_blocks, TPB, 0, stream>>>(count,
+      reinterpret_cast<const unsigned long long*>(input), hashes);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  error = cub::DeviceRadixSort::SortKeys(nullptr, sort_bytes,
+      hashes, sorted, count, 0, 64, stream);
+  if (error != cudaSuccess) return error;
+  error = cub::DeviceRadixSort::SortKeys(sort_storage, sort_bytes,
+      hashes, sorted, count, 0, 64, stream);
+  if (error != cudaSuccess) return error;
+  FCMp_8_kernel2<<<preprocessing_blocks, TPB, 0, stream>>>(count,
+      reinterpret_cast<const unsigned long long*>(input), sorted,
+      reinterpret_cast<unsigned long long*>(transformed));
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  input = transformed;
+  d_encode<<<blocks, TPB, 0, stream>>>(input,
+      static_cast<long long>(working), output, encoded_size, carry, counter);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  publish_size<<<1, 1, 0, stream>>>(encoded_size, output_bytes);
+  return cudaGetLastError();
+}
+} // namespace fpcompress_detail
+#endif
+
+#ifndef FPCOMPRESS_LIBRARY
 struct GPUTimer
 {
   cudaEvent_t beg, end;
@@ -387,3 +461,5 @@ int main(int argc, char* argv [])
   cudaFreeHost(dencoded);
   return 0;
 }
+
+#endif // FPCOMPRESS_LIBRARY
